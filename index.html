@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>kintone 認定アソシエイト試験 対策アプリ β版</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-container">
+    <header>
+      <h1>kintone 認定アソシエイト試験 対策アプリ β版</h1>
+      <p class="subtitle">起動時に問題バンクを構築、毎回10問をランダム出題</p>
+    </header>
+
+    <main>
+      <!-- スタート画面 -->
+      <section id="start-screen" class="card">
+        <h2>出題範囲</h2>
+        <ul class="features">
+          <li>フォルダ内のCSVファイルから問題を読み込み</li>
+          <li>読み込んだ問題から10問をランダムに出題します（重複なし）</li>
+          <li>2025年12月時点の公式ヘルプの内容をもとに作成しています。将来の仕様変更により実際の挙動と異なる場合があります。</li>
+        </ul>
+        <p id="load-status" style="color:#666; font-size:0.9rem;">読み込み待機中…</p>
+        <button id="start-btn" class="primary-btn" disabled>テストを開始する</button>
+      </section>
+
+      <!-- テスト画面 -->
+      <section id="quiz-screen" class="card hidden">
+        <div class="quiz-header">
+          <span id="question-number"></span>
+          <span id="category-label" class="badge"></span>
+        </div>
+
+        <p id="question-text" class="question-text"></p>
+        <div id="choices-container" class="choices"></div>
+        <div id="feedback" class="feedback"></div>
+
+        <div class="quiz-footer">
+          <div class="progress">
+            <div id="progress-bar" class="progress-bar"></div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="grade-btn"   class="secondary-btn" disabled>採点</button>
+            <button id="explain-btn" class="secondary-btn" disabled>解説</button>
+            <button id="next-btn"    class="primary-btn"  disabled>次の問題へ</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 結果画面 -->
+      <section id="result-screen" class="card hidden">
+        <h2>結果</h2>
+        <p id="score-summary" class="score-summary"></p>
+        <h3>各問題の振り返り</h3>
+        <div id="review-container" class="review-container"></div>
+
+        <div class="actions">
+          <button id="restart-btn" class="primary-btn">もう一度（新たに10問抽出）</button>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <small>β版 / CSV読み込み・10問ランダム・採点/解説ボタン対応</small>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
