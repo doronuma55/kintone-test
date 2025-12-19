@@ -5,6 +5,11 @@
   <title>kintone 認定アソシエイト試験 対策アプリ β版</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="style.css" />
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
 </head>
 <body>
   <div class="app-container">
@@ -68,5 +73,19 @@
   </div>
 
   <script src="app.js"></script>
+  <script>
+  // PWA用：Service Worker 登録
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", async () => {
+      try {
+        await navigator.serviceWorker.register("./sw.js");
+        // console.log("SW registered");
+      } catch (e) {
+        console.warn("SW registration failed:", e);
+      }
+    });
+  }
+  </script>
 </body>
 </html>
+
