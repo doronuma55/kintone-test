@@ -14,28 +14,36 @@
 </head>
 <body>
   <div class="app-container">
-    <header>
-      <h1>kintone 認定アソシエイト試験 対策アプリ β版</h1>
-      <p class="subtitle">起動時に問題バンクを構築、毎回10問をランダム出題</p>
+    <header class="app-header">
+      <h1>kintone 認定アソシエイト試験 対策アプリ <span class="beta">β</span></h1>
+      <p class="sub">CSV（result*.csv）から問題を読み込み、ランダムに10問出題します。</p>
     </header>
 
     <main>
       <!-- スタート画面 -->
       <section id="start-screen" class="card">
-        <h2>出題範囲</h2>
-        <ul class="features">
-          <li>フォルダ内のCSVファイルから問題を読み込み</li>
-          <li>読み込んだ問題から10問をランダムに出題します（重複なし）</li>
-          <li>2025年12月時点の公式ヘルプの内容をもとに作成しています。将来の仕様変更により実際の挙動と異なる場合があります。</li>
-        </ul>
-        <p id="load-status" style="color:#666; font-size:0.9rem;">読み込み待機中…</p>
-        <button id="start-btn" class="primary-btn" disabled>テストを開始する</button>
+        <h2>準備</h2>
+        <p id="load-status" class="muted">読み込み中…</p>
+
+        <div class="actions">
+          <button id="start-btn" class="primary-btn" disabled>テストを開始する（10問）</button>
+        </div>
+
+        <details class="hint">
+          <summary>うまく読み込めない場合</summary>
+          <ul>
+            <li><code>file://</code>直開きだと <code>fetch</code> が失敗することがあります。簡易サーバー（localhost）で開いてください。</li>
+            <li>同じフォルダに <code>result.csv</code>, <code>result (1).csv</code>, <code>result (2).csv</code> を置いてください。</li>
+          </ul>
+        </details>
       </section>
 
-      <!-- テスト画面 -->
+      <!-- クイズ画面 -->
       <section id="quiz-screen" class="card hidden">
         <div class="quiz-header">
-          <span id="question-number"></span>
+          <div class="meta">
+            <span id="question-number" class="muted"></span>
+          </div>
           <span id="category-label" class="badge"></span>
         </div>
 
@@ -48,6 +56,9 @@
             <div id="progress-bar" class="progress-bar"></div>
           </div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <!-- ★追加：解説修正用にコピー -->
+            <button id="copy-edit-btn" class="secondary-btn" disabled>解説修正用にコピー</button>
+
             <button id="grade-btn"   class="secondary-btn" disabled>採点</button>
             <button id="explain-btn" class="secondary-btn" disabled>解説</button>
             <button id="next-btn"    class="primary-btn"  disabled>次の問題へ</button>
@@ -69,18 +80,18 @@
     </main>
 
     <footer>
-      <small>β版 / CSV読み込み・10問ランダム・採点/解説ボタン対応</small>
+      <small>β版 / CSV読み込み・10問ランダム・採点/解説ボタン / 選択肢は毎回シャッフル</small>
     </footer>
   </div>
 
   <script src="app.js"></script>
+
   <script>
-  // PWA用：Service Worker 登録
+  // Service Worker（存在する場合のみ）
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", async () => {
       try {
         await navigator.serviceWorker.register("./sw.js");
-        // console.log("SW registered");
       } catch (e) {
         console.warn("SW registration failed:", e);
       }
@@ -89,5 +100,3 @@
   </script>
 </body>
 </html>
-
-

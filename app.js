@@ -10,25 +10,15 @@ const QUESTIONS_PER_QUIZ = 10;
 
 // デバッグ用：特定の問題だけを出題したいときの ID リスト
 // 形式は「練習問題セット-設問」。例：セット1の設問3 → "1-3"
-// ★ セット1の設問1〜3だけを出したいので、ひとまずこの3つを指定
 const FIXED_QUESTION_IDS = [];
 
 // ★ できるだけ広く出題したい：学習回数（= 1回10問のセット）をこの回数で回すと、全問を一通り出しやすくする
-//   - 完全に「順繰り」にはせず、毎回ランダム性も残します（同じ問題が何度か出るのは許容）。
-const TARGET_COVERAGE_QUIZZES = 20;
-
-// 出題履歴（何回出たか／いつ出たか）をブラウザに保存するキー
-const QUIZ_STATS_STORAGE_KEY = "kintone_quiz_stats_v1";
-// 通常どおり全問題からランダム出題したくなったら、上を null か [] に変更する：
-// const FIXED_QUESTION_IDS = null;
-
+const TARGET_RUNS_TO_SEE_ALL = 20;
 
 
 /***********************
  * ユーティリティ
  ***********************/
-
-// document.getElementById の短縮版
 const $ = (id) => document.getElementById(id);
 
 // XSS 対策用：HTML に差し込むテキストは必ず escape する
@@ -38,31 +28,35 @@ function escapeHTML(str) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+    .replaceAll("'", "&#039;");
 }
 
-// 0,1,2,... を A,B,C,... のラベルに変換する（画面表示用）
-function indexToLabel(index) {
-  return String.fromCharCode("A".charCodeAt(0) + index);
-}
-
-// URL が http/https の場合だけ <a> に変換する。
-// それ以外は単なるテキストとして扱う。
-function linkOrText(url) {
-  if (!url) return "";
-  const trimmed = url.trim();
-  if (!/^https?:\/\//i.test(trimmed)) {
-    return escapeHTML(trimmed);
+function shuffleArray(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
-  return `<a href="${trimmed}" target="_blank" rel="noopener noreferrer">${escapeHTML(trimmed)}</a>`;
+  return a;
 }
 
-/**
- * シンプルな CSV パーサ
- * - Excel から出した標準的な CSV を想定
- * - ダブルクォートで囲まれたフィールド内のカンマ・改行に対応
- * - RFC 完全準拠ではないが、今回の用途には十分
- */
+function indexToLabel(i) {
+  return String.fromCharCode("A".charCodeAt(0) + i);
+}
+
+function linkOrText(url) {
+  const u = String(url ?? "").trim();
+  if (!u) return "";
+  if (/^https?:\/\//i.test(u)) {
+    return `<a href="${escapeHTML(u)}" target="_blank" rel="noopener noreferrer">${escapeHTML(u)}</a>`;
+  }
+  return escapeHTML(u);
+}
+
+
+/***********************
+ * CSV パーサ（シンプル・クォート対応）
+ ***********************/
 function parseCSV(text) {
   const rows = [];
   let row = [];
@@ -79,7 +73,6 @@ function parseCSV(text) {
         cur += '"';
         i++;
       } else if (ch === '"') {
-        // クォート閉じ
         inQuotes = false;
       } else {
         cur += ch;
@@ -96,173 +89,107 @@ function parseCSV(text) {
         row = [];
         cur = "";
       } else if (ch === "\r") {
-        // CR は無視（CRLF 対応）
+        // \r\n など
+        continue;
       } else {
         cur += ch;
       }
     }
   }
 
-  // 最後のフィールド・行を追加
+  // 最後のセル
   row.push(cur);
   rows.push(row);
 
-  // 完全に空の行は除去
-  return rows.filter(r => r.some(c => (c ?? "").trim() !== ""));
+  // 空行っぽいものを削る
+  return rows.filter(r => r.some(c => String(c ?? "").trim() !== ""));
 }
 
-// 配列をシャッフル（Fisher–Yates）
-function shuffleArray(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
 
 /***********************
- * 出題履歴（localStorage）と「出やすさ調整」ロジック
- *
- * 目的：
- * - 10問×20回くらいで、なるべく全体（例：135問）を一通り出す
- * - ただし「順繰り」ではなく、ランダム性も残して復習（重複）も混ぜる
- *
- * 仕組み（ざっくり）：
- * - quizRun（何回目の10問セットか）と、各問題の seen（出題回数）、lastSeen（最後に出た回）を保存
- * - 毎回「未出題」を優先して一定数混ぜつつ、残りは「出題回数が少ないほど出やすい」重み付き抽選
+ * クイズ履歴（ローカルストレージ）
+ * 目的：できるだけ広く出題されるように、直近で出した問題を避ける
  ***********************/
+const STATS_KEY = "kintone_quiz_stats_v1";
+
+/**
+ * stats = {
+ *   quizRun: number,
+ *   byId: {
+ *     [id]: { seen: number, lastSeen: number }
+ *   }
+ * }
+ */
 function loadQuizStats() {
   try {
-    const raw = localStorage.getItem(QUIZ_STATS_STORAGE_KEY);
+    const raw = localStorage.getItem(STATS_KEY);
     if (!raw) return { quizRun: 0, byId: {} };
-    const obj = JSON.parse(raw);
-    if (!obj || typeof obj !== "object") return { quizRun: 0, byId: {} };
-    if (typeof obj.quizRun !== "number") obj.quizRun = 0;
-    if (!obj.byId || typeof obj.byId !== "object") obj.byId = {};
-    return obj;
-  } catch (e) {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== "object") return { quizRun: 0, byId: {} };
+    if (!data.byId) data.byId = {};
+    if (typeof data.quizRun !== "number") data.quizRun = 0;
+    return data;
+  } catch {
     return { quizRun: 0, byId: {} };
   }
 }
 
 function saveQuizStats(stats) {
   try {
-    localStorage.setItem(QUIZ_STATS_STORAGE_KEY, JSON.stringify(stats));
-  } catch (e) {
-    // localStorage が使えない環境でもアプリ自体は動かす
-    console.warn("Failed to save quiz stats:", e);
+    localStorage.setItem(STATS_KEY, JSON.stringify(stats));
+  } catch {
+    // ignore
   }
 }
 
 function getStat(stats, id) {
-  const s = stats.byId[id];
-  if (s && typeof s === "object") {
-    return {
-      seen: typeof s.seen === "number" ? s.seen : 0,
-      lastSeen: typeof s.lastSeen === "number" ? s.lastSeen : -9999
-    };
-  }
-  return { seen: 0, lastSeen: -9999 };
+  return stats.byId[id] || { seen: 0, lastSeen: -1 };
 }
 
-function setStat(stats, id, next) {
-  stats.byId[id] = { seen: next.seen, lastSeen: next.lastSeen };
+function setStat(stats, id, value) {
+  stats.byId[id] = value;
 }
 
 /**
- * 重み付き抽選（重複なし）で k 個選ぶ
- * items: 配列（要素はオブジェクトでもOK）
- * getWeight: (item) => number（0以上。0は選ばれない）
+ * 出題ロジック：
+ * - FIXED_QUESTION_IDS があればそれを優先
+ * - そうでなければ「最近出ていない問題」を優先して抽出
  */
-function weightedSampleWithoutReplacement(items, k, getWeight) {
-  const pool = [...items];
-  const picked = [];
-
-  for (let t = 0; t < k && pool.length > 0; t++) {
-    // 重み合計
-    let total = 0;
-    const weights = pool.map(it => {
-      const w = Math.max(0, Number(getWeight(it)) || 0);
-      total += w;
-      return w;
-    });
-
-    // すべて 0 の場合は、残りをランダムに拾う
-    if (total <= 0) {
-      const shuffled = shuffleArray(pool);
-      picked.push(...shuffled.slice(0, k - picked.length));
-      break;
-    }
-
-    // ルーレット選択
-    let r = Math.random() * total;
-    let idx = 0;
-    for (let i = 0; i < pool.length; i++) {
-      r -= weights[i];
-      if (r <= 0) {
-        idx = i;
-        break;
-      }
-    }
-    picked.push(pool[idx]);
-    pool.splice(idx, 1);
+function pickQuestions(all, n) {
+  if (FIXED_QUESTION_IDS.length > 0) {
+    const map = new Map(all.map(q => [q.id, q]));
+    const picked = FIXED_QUESTION_IDS.map(id => map.get(id)).filter(Boolean);
+    return picked.slice(0, n);
   }
 
-  return picked;
-}
-
-/**
- * 10問セットを作る（未出題を優先しつつ、復習（重複）も混ぜる）
- */
-function selectQuizQuestions(pool, count) {
   const stats = loadQuizStats();
-  const nextRun = stats.quizRun + 1;
+  const nextRun = (stats.quizRun || 0) + 1;
 
-  // 全体を TARGET_COVERAGE_QUIZZES 回くらいで一通り出すために、毎回「最低この数」は未出題を混ぜる
-  const targetNewPerQuiz = Math.min(
-    count,
-    Math.max(1, Math.ceil(pool.length / TARGET_COVERAGE_QUIZZES))
-  );
-
-  // 未出題（seen===0）
-  const unseen = pool.filter(q => getStat(stats, q.id).seen === 0);
-  const newCount = Math.min(targetNewPerQuiz, unseen.length, count);
-
-  // まず未出題からランダムに newCount 取る（未出題同士は同等）
-  const pickedNew = shuffleArray(unseen).slice(0, newCount);
-
-  // 残りは「出題回数が少ないほど」「直近に出ていないほど」出やすくする（ただしゼロにはしない）
-  const pickedIds = new Set(pickedNew.map(q => q.id));
-  const restPool = pool.filter(q => !pickedIds.has(q.id));
-  const restCount = count - pickedNew.length;
-
-  // 直近に出た問題を少し避けるためのウィンドウ（何回分）
-  const RECENT_WINDOW = 3;
-
-  const pickedRest = weightedSampleWithoutReplacement(restPool, restCount, (q) => {
+  // スコアリング：lastSeen が古いほど優先（見たことないものは最優先）
+  const scored = all.map(q => {
     const s = getStat(stats, q.id);
-    const seen = s.seen;
-    const since = nextRun - s.lastSeen;
+    const seen = s.seen || 0;
+    const lastSeen = (typeof s.lastSeen === "number") ? s.lastSeen : -1;
 
-    // 出題回数が多いほど重みを下げる（復習は残しつつ、未出題/少数回を優先）
-    const countPenalty = 1 / Math.pow(1 + seen, 1.15);
-
-    // 直近に出たら少しだけ出にくくする
-    const recencyPenalty = since <= RECENT_WINDOW ? 0.25 : 1;
-
-    // 完全に0にはしない（偶然の復習も起きる）
-    const base = 0.0001;
-
-    return base + countPenalty * recencyPenalty;
+    // lastSeen が -1（未出題）は優先
+    // それ以外は「今からどれだけ離れているか」で優先
+    const gap = (lastSeen < 0) ? 999999 : (nextRun - lastSeen);
+    return { q, seen, lastSeen, gap };
   });
 
-  const picked = [...pickedNew, ...pickedRest];
+  // gap 大きい（古い）→ seen 少ない → ランダム
+  scored.sort((a, b) => {
+    if (b.gap !== a.gap) return b.gap - a.gap;
+    if (a.seen !== b.seen) return a.seen - b.seen;
+    return Math.random() - 0.5;
+  });
 
-  // この時点で「出題した」扱いとして履歴を更新（同一セット内は重複しない）
+  const picked = scored.slice(0, n).map(x => x.q);
+
+  // stats 更新
   picked.forEach(q => {
     const s = getStat(stats, q.id);
-    setStat(stats, q.id, { seen: s.seen + 1, lastSeen: nextRun });
+    setStat(stats, q.id, { seen: (s.seen || 0) + 1, lastSeen: nextRun });
   });
   stats.quizRun = nextRun;
   saveQuizStats(stats);
@@ -274,21 +201,12 @@ function selectQuizQuestions(pool, count) {
 /***********************
  * 解説レイヤー（explanations.json）
  ***********************/
-
-// explanations.json から読み込んだ「id → 解説オブジェクト」のマップ
-// 形式： { "1-1": { id, title, body, links }, ... }
 let explanationsById = {};
-
-// 解説全体の「○○現在」的な日付（JSON の asOf ）
 let explanationsAsOf = null;
 
-/**
- * explanations.json を fetch して、explanationsById に詰める
- * - 失敗しても致命的ではないので、エラー時はコンソールに出して無視
- */
 async function loadExplanations() {
   try {
-    const res = await fetch("explanations.json"); // index.html と同階層に配置したファイル
+    const res = await fetch("explanations.json");
     if (!res.ok) {
       console.warn("explanations.json 読み込み失敗:", res.status);
       return;
@@ -306,7 +224,6 @@ async function loadExplanations() {
     }
 
     console.log("explanations.json を読み込みました。件数:", Object.keys(explanationsById).length);
-
   } catch (e) {
     console.warn("explanations.json 読み込み中にエラー:", e);
   }
@@ -317,12 +234,11 @@ async function loadExplanations() {
  * CSV → 問題オブジェクト変換
  * （result*.csv 専用のマッピング）
  ***********************/
-
 /**
- * 1つの CSV（2次元配列）から、内部で扱う問題オブジェクト配列に変換する。
- * - 今回のポイント：
+ * result.csv 系の前提：
  *   - 「練習問題セット」「設問」から一意な id ("1-3" など) を採番
- *   - 選択肢は { text, isCorrect, helpUrl, textRef } の形で、A/B/C/D に依存しない
+ *   - 選択肢は { text, rawText, isCorrect, helpUrl, textRef } の形
+ *   - rawText は「原文厳格引用」用（trim しない）
  */
 function buildQuestionsFromResultCsv(rows) {
   if (!rows || rows.length < 2) return [];
@@ -336,34 +252,36 @@ function buildQuestionsFromResultCsv(rows) {
     qNo:      hIndex("設問"),
     category: hIndex("カテゴリ"),
     question: hIndex("出題内容"),
-    correct:  hIndex("正答"),
-
     choiceA:  hIndex("選択肢A"),
     choiceB:  hIndex("選択肢B"),
     choiceC:  hIndex("選択肢C"),
     choiceD:  hIndex("選択肢D"),
-
-    urlA:     hIndex("選択肢A ヘルプ参照先URL"),
-    urlB:     hIndex("選択肢B ヘルプ参照先URL"),
-    urlC:     hIndex("選択肢C ヘルプ参照先URL"),
-    urlD:     hIndex("選択肢D ヘルプ参照先URL"),
-
-    textRefA: hIndex("選択肢A テキスト参照先"),
-    textRefB: hIndex("選択肢B テキスト参照先"),
-    textRefC: hIndex("選択肢C テキスト参照先"),
-    textRefD: hIndex("選択肢D テキスト参照先"),
+    correct:  hIndex("正解"),
+    urlA:     hIndex("関連リンクA"),
+    urlB:     hIndex("関連リンクB"),
+    urlC:     hIndex("関連リンクC"),
+    urlD:     hIndex("関連リンクD"),
+    textRefA: hIndex("参照テキストA"),
+    textRefB: hIndex("参照テキストB"),
+    textRefC: hIndex("参照テキストC"),
+    textRefD: hIndex("参照テキストD"),
   };
-
-  // 最低限必要なのは「問題文」と「正答」
-  if (idx.question === -1 || idx.correct === -1) return [];
 
   const questions = [];
 
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
-    const get = (i) => (i >= 0 && i < row.length ? (row[i] ?? "").trim() : "");
 
-    const text = get(idx.question);
+    const getRaw = (i) => (i >= 0 && i < row.length ? (row[i] ?? "") : "");
+    const get = (i) => getRaw(i).trim();
+
+    const setNo = get(idx.setNo);
+    const qNo = get(idx.qNo);
+    const id = (setNo && qNo) ? `${setNo}-${qNo}` : `row-${r}`;
+
+    const category = get(idx.category);
+    const textRaw = getRaw(idx.question);
+    const text = textRaw.trim();
     const correctRaw = get(idx.correct).toUpperCase();
 
     if (!text || !correctRaw) continue;
@@ -376,45 +294,33 @@ function buildQuestionsFromResultCsv(rows) {
           .filter(ch => ["A", "B", "C", "D"].includes(ch))
       )
     );
-    if (correctKeys.length === 0) continue;
-
-    const category = get(idx.category) || "";
-
-    // 練習問題セット + 設問 から一意な ID を作る
-    const setNoRaw = idx.setNo >= 0 ? get(idx.setNo) : "";
-    const qNoRaw   = idx.qNo   >= 0 ? get(idx.qNo)   : "";
-
-    let id = "";
-    if (setNoRaw && qNoRaw) {
-      // 例：セット1の設問3 → "1-3"
-      id = `${setNoRaw}-${qNoRaw}`;
-    } else {
-      // 万一どちらか欠けている場合は、行番号ベースの ID にフォールバック
-      id = `row-${r}`;
-    }
 
     // 各選択肢を「中身＋正誤フラグ」で定義（A/B/C/D のラベル自体には依存しない）
     const rawChoices = [
       {
         colKey: "A",
+        rawText: getRaw(idx.choiceA),
         text: get(idx.choiceA),
         helpUrl: get(idx.urlA),
         textRef: get(idx.textRefA),
       },
       {
         colKey: "B",
+        rawText: getRaw(idx.choiceB),
         text: get(idx.choiceB),
         helpUrl: get(idx.urlB),
         textRef: get(idx.textRefB),
       },
       {
         colKey: "C",
+        rawText: getRaw(idx.choiceC),
         text: get(idx.choiceC),
         helpUrl: get(idx.urlC),
         textRef: get(idx.textRefC),
       },
       {
         colKey: "D",
+        rawText: getRaw(idx.choiceD),
         text: get(idx.choiceD),
         helpUrl: get(idx.urlD),
         textRef: get(idx.textRefD),
@@ -429,6 +335,7 @@ function buildQuestionsFromResultCsv(rows) {
         // 「どの列から来たか」は id に残しておく（現状は使っていないがデバッグ用）
         id: idxChoice,
         text: c.text,
+        rawText: c.rawText ?? c.text,
         isCorrect: correctKeys.includes(c.colKey),
         helpUrl: c.helpUrl,
         textRef: c.textRef,
@@ -444,6 +351,7 @@ function buildQuestionsFromResultCsv(rows) {
       id,                          // 解説レイヤーと紐づけるための一意な ID
       category,
       text,
+      textRaw,
       choices,                     // A/B/C/D に依存しない「内容＋正誤フラグ」
       isMultiple: correctCount > 1 // true → 複数選択問題
     });
@@ -459,18 +367,17 @@ function buildQuestionsFromResultCsv(rows) {
 
 // CSV から読み込んだ全問題
 let allQuestions = [];
+// 参照用：id → 元の問題（CSV順の選択肢を保持）
+let allQuestionsById = {};
 
-// 今回の 10 問セット（選択肢シャッフル後）
+// 今回の10問
 let currentQuizQuestions = [];
-
-// 現在表示中のインデックス（0 開始）
 let currentIndex = 0;
 
-// 各問題について、ユーザーが選んだ選択肢のインデックス配列
-// 例：[[0], [1,3], [], ...]
+// 各問題の回答（選択した choiceIndex の配列）
 let userAnswers = [];
 
-// 各問題の採点・解説状態
+// 状態（採点済み/解説表示済み）
 let questionStates = [];
 
 // 合計正解数
@@ -486,10 +393,12 @@ const resultScreen = $("result-screen");
 
 const loadStatus   = $("load-status");
 const startBtn     = $("start-btn");
+
 const gradeBtn     = $("grade-btn");
 const explainBtn   = $("explain-btn");
 const nextBtn      = $("next-btn");
 const restartBtn   = $("restart-btn");
+const copyEditBtn = $("copy-edit-btn");
 
 const questionNumberEl = $("question-number");
 const categoryLabelEl  = $("category-label");
@@ -546,6 +455,12 @@ async function loadQuestionBank() {
 
   allQuestions = loaded;
 
+  // id→問題（元データ）マップを作成
+  allQuestionsById = {};
+  for (const q of allQuestions) {
+    if (q && q.id) allQuestionsById[q.id] = q;
+  }
+
   if (allQuestions.length === 0) {
     loadStatus.textContent = "有効な問題が1件も読み込めませんでした。CSVファイルの配置と内容を確認してください。";
     startBtn.disabled = true;
@@ -557,35 +472,15 @@ async function loadQuestionBank() {
 
 
 /***********************
- * テスト開始・再開
+ * クイズ開始
  ***********************/
 function startQuiz() {
-  if (allQuestions.length === 0) return;
+  if (!allQuestions || allQuestions.length === 0) return;
 
-  // ▼ 出題プールを決める
-  //   - FIXED_QUESTION_IDS に配列が入っていれば、そのIDの問題だけに絞る
-  //   - null や空配列なら、全問題を対象にする
-  let pool = allQuestions;
+  // 出題問題を抽出（最近出ていないもの優先）
+  const picked = pickQuestions(allQuestions, QUESTIONS_PER_QUIZ);
 
-  if (Array.isArray(FIXED_QUESTION_IDS) && FIXED_QUESTION_IDS.length > 0) {
-    const idSet = new Set(FIXED_QUESTION_IDS);
-    const filtered = allQuestions.filter(q => idSet.has(q.id));
-
-    if (filtered.length === 0) {
-      // IDが1つも見つからなかったときは全問題にフォールバック
-      console.warn("FIXED_QUESTION_IDS に対応する問題が見つかりませんでした。全問題から出題します。");
-    } else {
-      pool = filtered;
-    }
-  }
-
-  // 1セットの問題数は、定数とプールの小さい方
-  const count = Math.min(QUESTIONS_PER_QUIZ, pool.length);
-
-  // ▼ 出題セットを作る（履歴を見て「未出題を優先しつつ、復習も混ぜる」）
-  const picked = selectQuizQuestions(pool, count);
-
-  // 出題用の配列を作る（選択肢もシャッフルしたコピー）
+  // 画面表示用に、選択肢の順番だけ毎回シャッフル
   currentQuizQuestions = picked.map(q => ({
     ...q,
     choices: shuffleArray(q.choices) // ★ 選択肢の順番を毎回ランダム化
@@ -605,9 +500,8 @@ function startQuiz() {
 }
 
 
-
 /***********************
- * 現在の問題表示
+ * 現在の問題を描画
  ***********************/
 function renderCurrentQuestion() {
   const total = currentQuizQuestions.length;
@@ -649,24 +543,9 @@ function renderCurrentQuestion() {
       btn.classList.add("selected");
     }
 
-    if (state.graded) {
-      // 採点後は操作不可・色だけ表示
-      btn.disabled = true;
-      const isCorrect = choice.isCorrect;
-      const isSelected = selectedIndexes.has(idx);
-
-      if (isCorrect) {
-        btn.classList.add("correct");
-      }
-      if (isSelected && !isCorrect) {
-        btn.classList.add("incorrect");
-      }
-    } else {
-      // 未採点時：クリックで選択
-      btn.addEventListener("click", () => {
-        toggleChoiceSelection(idx);
-      });
-    }
+    btn.addEventListener("click", () => {
+      toggleChoiceSelection(idx);
+    });
 
     choicesContainer.appendChild(btn);
   });
@@ -682,6 +561,8 @@ function renderCurrentQuestion() {
     explainBtn.disabled = state.explained;
     nextBtn.disabled = !state.explained;
   }
+
+  if (copyEditBtn) copyEditBtn.disabled = false;
 }
 
 
@@ -695,18 +576,18 @@ function toggleChoiceSelection(choiceIndex) {
   const arr = userAnswers[currentIndex];
   const idx = Number(choiceIndex);
 
-  if (q.isMultiple) {
-    // 複数選択可 → チェックボックス風トグル
-    const pos = arr.indexOf(idx);
-    if (pos === -1) {
-      arr.push(idx);
-    } else {
-      arr.splice(pos, 1);
-    }
+  if (!q.isMultiple) {
+    // 単一選択：1つに置き換える
+    userAnswers[currentIndex] = [idx];
   } else {
-    // 単一選択 → 常に1つだけ選ばれている状態にする
-    arr.length = 0;
-    arr.push(idx);
+    // 複数選択：トグル
+    const pos = arr.indexOf(idx);
+    if (pos >= 0) {
+      arr.splice(pos, 1);
+    } else {
+      arr.push(idx);
+    }
+    userAnswers[currentIndex] = arr;
   }
 
   renderCurrentQuestion();
@@ -714,71 +595,53 @@ function toggleChoiceSelection(choiceIndex) {
 
 
 /***********************
- * 採点（選択肢の isCorrect フラグで判定）
+ * 採点
  ***********************/
 function gradeCurrentQuestion() {
   const q = currentQuizQuestions[currentIndex];
   const state = questionStates[currentIndex];
-
   if (state.graded) return;
 
   const userIndexes = Array.from(new Set(userAnswers[currentIndex])).sort((a, b) => a - b);
-  if (userIndexes.length === 0) return;
 
   const correctIndexes = q.choices
     .map((choice, idx) => (choice.isCorrect ? idx : null))
     .filter(idx => idx !== null);
 
-  const userSet = new Set(userIndexes);
-  const correctSet = new Set(correctIndexes);
-
-  let isCorrect = true;
-
-  // 正しい選択肢が全て選ばれているか
-  for (const i of correctSet) {
-    if (!userSet.has(i)) {
-      isCorrect = false;
-      break;
-    }
-  }
-  // 余分な選択がないか
-  if (isCorrect) {
-    for (const i of userSet) {
-      if (!correctSet.has(i)) {
-        isCorrect = false;
-        break;
-      }
-    }
-  }
+  const isCorrect =
+    userIndexes.length === correctIndexes.length &&
+    userIndexes.every((v, i) => v === correctIndexes[i]);
 
   state.graded = true;
   state.isCorrect = isCorrect;
-  if (isCorrect) scoreCount++;
 
-  // ボタンの見た目更新
-  const buttons = choicesContainer.querySelectorAll(".choice-btn");
-  buttons.forEach((btn, idx) => {
-    const isC = q.choices[idx].isCorrect;
-    const isSel = userSet.has(idx);
+  if (isCorrect) scoreCount += 1;
+
+  // 選択肢の見た目を更新（正解/不正解ハイライト）
+  Array.from(choicesContainer.querySelectorAll("button.choice-btn")).forEach(btn => {
+    const idx = Number(btn.dataset.index);
+    const choice = q.choices[idx];
 
     btn.disabled = true;
-    if (isC) btn.classList.add("correct");
-    if (isSel && !isC) btn.classList.add("incorrect");
+
+    if (choice.isCorrect) {
+      btn.classList.add("correct");
+    } else if (userIndexes.includes(idx)) {
+      btn.classList.add("wrong");
+    }
   });
 
-  const typeLabel = q.isMultiple ? "（複数選択問題）" : "（単一選択問題）";
+  // フィードバック表示
   feedbackEl.innerHTML = isCorrect
-    ? `✔ 正解です！${typeLabel}`
-    : `✖ 不正解です。${typeLabel}`;
+    ? `<div class="ok">正解！</div>`
+    : `<div class="ng">不正解…</div>`;
 
-  gradeBtn.disabled = true;
-  explainBtn.disabled = false;
-  nextBtn.disabled = true;
+  renderCurrentQuestion();
 }
 
 
 /***********************
- * 解説表示（explanations.json と連動）
+ * 解説表示（画面用）
  ***********************/
 function showExplanation() {
   const q = currentQuizQuestions[currentIndex];
@@ -796,10 +659,19 @@ function showExplanation() {
   const userText = userLabels.length ? userLabels.join(", ") : "（未回答）";
   const correctText = correctLabels.join(", ");
 
-  let html = feedbackEl.innerHTML;
-  html += "<br>";
-  html += `正解：${escapeHTML(correctText)}<br>`;
-  html += `あなたの回答：${escapeHTML(userText)}<br>`;
+  // explanations.json の本文を優先（なければ簡易説明）
+  const exp = explanationsById[q.id] || null;
+
+  let html = `<hr>`;
+  html += `<div class="explain">`;
+  html += `<div class="muted">あなたの回答：${escapeHTML(userText)}<br>`;
+  html += `正解：${escapeHTML(correctText)}</div>`;
+
+  if (exp && exp.body) {
+    html += `<pre class="explain-body">${escapeHTML(exp.body)}</pre>`;
+  } else {
+    html += `<p class="muted">（この問題の解説は未登録です：explanations.json に id=${escapeHTML(q.id)} を追加してください）</p>`;
+  }
 
   // 関連ヘルプ／テキスト：CSV 側に載っている URL / テキスト参照先を表示
   const helpLines = [];
@@ -818,60 +690,30 @@ function showExplanation() {
   });
 
   if (helpLines.length > 0) {
-    html += "<br>関連ヘルプ／テキスト参照先（問題ごとに設定されたもの）：<br>";
+    html += `<div class="refs"><div class="muted">参照</div><ul>`;
     helpLines.forEach(line => {
-      html += `${line}<br>`;
+      html += `<li>${line}</li>`;
     });
+    html += `</ul></div>`;
   }
 
-  // ★ explanations.json 側の「本気解説」を表示（あれば）
-  const exp = q.id ? explanationsById[q.id] : null;
+  html += `</div>`;
 
-  if (exp && exp.body) {
-    html += "<br>解説：<br>";
-    const bodyHtml = escapeHTML(exp.body).replace(/\n/g, "<br>");
-    html += bodyHtml;
-
-    // 「2025-12-09 現在」のような注釈（全体 asOf が優先。なければ item.asOf）
-    const asOf = explanationsAsOf || exp.asOf;
-    if (asOf) {
-      html += `<br><small>※この解説は ${escapeHTML(asOf)} 時点の情報に基づいています。最新の仕様や詳細は必ず公式ヘルプを確認してください。</small>`;
-    }
-  }
-
-  // explanations.json 内の「関連リンク」
-  if (exp && Array.isArray(exp.links) && exp.links.length > 0) {
-    html += "<br>関連リンク（公式ヘルプなど）：<br>";
-    for (const link of exp.links) {
-      if (!link) continue;
-      const label = escapeHTML(link.label || link.url || "");
-      const url   = link.url ? escapeHTML(link.url) : "";
-      if (url) {
-        html += `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a><br>`;
-      } else if (label) {
-        html += `${label}<br>`;
-      }
-    }
-  }
-
-  feedbackEl.innerHTML = html;
+  feedbackEl.innerHTML += html;
 
   state.explained = true;
-  explainBtn.disabled = true;
-  nextBtn.disabled = false;
+  renderCurrentQuestion();
 }
 
 
 /***********************
- * 次の問題へ
+ * 次へ
  ***********************/
 function goToNextQuestion() {
   const total = currentQuizQuestions.length;
-  const state = questionStates[currentIndex];
-  if (!state.graded || !state.explained) return;
 
   if (currentIndex < total - 1) {
-    currentIndex++;
+    currentIndex += 1;
     renderCurrentQuestion();
   } else {
     showResult();
@@ -883,16 +725,17 @@ function goToNextQuestion() {
  * 結果画面
  ***********************/
 function showResult() {
-  const total = currentQuizQuestions.length;
-  const rate = total > 0 ? Math.round((scoreCount / total) * 100) : 0;
+  showScreen("result");
 
-  scoreSummaryEl.textContent = `全 ${total} 問中 ${scoreCount} 問正解（正答率 ${rate}%）`;
+  scoreSummaryEl.textContent = `あなたのスコア：${scoreCount} / ${currentQuizQuestions.length}`;
 
+  // レビュー表示
   reviewContainer.innerHTML = "";
 
-  currentQuizQuestions.forEach((q, qi) => {
-    const state = questionStates[qi];
-    const userIndexes = Array.from(new Set(userAnswers[qi])).sort((a, b) => a - b);
+  currentQuizQuestions.forEach((q, i) => {
+    const state = questionStates[i];
+    const userIndexes = Array.from(new Set(userAnswers[i])).sort((a, b) => a - b);
+
     const correctIndexes = q.choices
       .map((choice, idx) => (choice.isCorrect ? idx : null))
       .filter(idx => idx !== null);
@@ -900,57 +743,115 @@ function showResult() {
     const userLabels = userIndexes.map(indexToLabel);
     const correctLabels = correctIndexes.map(indexToLabel);
 
-    const item = document.createElement("div");
-    item.className = "review-item";
+    const userText = userLabels.length ? userLabels.join(", ") : "（未回答）";
+    const correctText = correctLabels.join(", ");
 
-    const title = document.createElement("h4");
-    title.textContent = `第 ${qi + 1} 問：${q.category || ""}`;
-    item.appendChild(title);
+    const div = document.createElement("div");
+    div.className = "review-item";
 
-    const qText = document.createElement("p");
-    qText.textContent = q.text;
-    item.appendChild(qText);
+    div.innerHTML = `
+      <div class="review-head">
+        <span class="badge">Q${i + 1}</span>
+        <span class="${state.isCorrect ? "ok" : "ng"}">${state.isCorrect ? "正解" : "不正解"}</span>
+        <span class="muted">（問題ID：${escapeHTML(q.id)}）</span>
+      </div>
+      <div class="review-q">${escapeHTML(q.text)}</div>
+      <div class="muted">あなたの回答：${escapeHTML(userText)} / 正解：${escapeHTML(correctText)}</div>
+    `;
 
-    const your = document.createElement("p");
-    your.textContent = `あなたの回答：${userLabels.length ? userLabels.join(", ") : "（未回答）"}`;
-    item.appendChild(your);
-
-    const correct = document.createElement("p");
-    correct.textContent = `正解：${correctLabels.join(", ")}`;
-    item.appendChild(correct);
-
-    const result = document.createElement("p");
-    result.textContent = state.isCorrect ? "→ 正解" : "→ 不正解";
-    item.appendChild(result);
-
-    // 下の方にも、CSV由来のヘルプ／テキスト参照先をまとめておく
-    const helpLines = [];
-    q.choices.forEach((choice, idx) => {
-      const label = indexToLabel(idx);
-      const parts = [];
-      if (choice.helpUrl) parts.push(`ヘルプ: ${linkOrText(choice.helpUrl)}`);
-      if (choice.textRef) parts.push(`テキスト: ${escapeHTML(choice.textRef)}`);
-      if (parts.length > 0) {
-        helpLines.push(`[${label}] ${parts.join(" / ")}`);
-      }
-    });
-
-    if (helpLines.length > 0) {
-      const helpP = document.createElement("p");
-      helpP.innerHTML = "関連ヘルプ／テキスト参照先（問題ごとに設定されたもの）：<br>" +
-        helpLines.join("<br>");
-      item.appendChild(helpP);
-    }
-
-    reviewContainer.appendChild(item);
+    reviewContainer.appendChild(div);
   });
-
-  showScreen("result");
 }
 
 
 /***********************
- * イベント登録（初期化）
+ * 解説修正用にコピー
+ * - CSV順（choice1→）の原文を維持
+ * - ABCD表記は出さない（アプリ上はシャッフルされるため）
+ ***********************/
+function buildCopyTextForQuestion(qId) {
+  const qOriginal = (qId && allQuestionsById && allQuestionsById[qId]) ? allQuestionsById[qId] : null;
+  const q = qOriginal || currentQuizQuestions[currentIndex];
+
+  const questionTextRaw = (q.textRaw ?? q.text ?? "");
+  const choices = Array.isArray(qOriginal?.choices) ? qOriginal.choices : (q.choices ?? []);
+  const correctChoices = choices.filter(c => c.isCorrect).map(c => (c.rawText ?? c.text ?? ""));
+
+  const exp = (q.id && explanationsById && explanationsById[q.id]) ? explanationsById[q.id] : null;
+  const body = exp?.body ?? "";
+
+  const lines = [];
+  lines.push(`問題ID：${q.id}`);
+  lines.push(`設問：`);
+  lines.push(String(questionTextRaw));
+  lines.push("");
+  lines.push("選択肢（CSV順・原文厳格引用）");
+  choices.forEach((c, i) => {
+    lines.push(`（${i + 1}）`);
+    lines.push(String(c.rawText ?? c.text ?? ""));
+    lines.push("");
+  });
+
+  lines.push("正解（原文）");
+  if (correctChoices.length === 0) {
+    lines.push("（不明）");
+  } else {
+    correctChoices.forEach(t => lines.push(`・${String(t)}`));
+  }
+
+  lines.push("");
+  lines.push("現在の解説（body）：");
+  lines.push(body ? String(body) : "（未登録）");
+
+  lines.push("");
+  lines.push("追加指示（任意）：");
+
+  return lines.join("\n");
+}
+
+async function copyTextToClipboard(text) {
+  // localhost / https は isSecureContext になりやすい。file:// は失敗しやすい。
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) {}
+
+  // フォールバック（古いブラウザ/非セキュアコンテキスト用）
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function copyForEditCurrentQuestion() {
+  const q = currentQuizQuestions[currentIndex];
+  const text = buildCopyTextForQuestion(q?.id);
+
+  const ok = await copyTextToClipboard(text);
+
+  const msg = ok ? "解説修正用テキストをコピーしました。" : "コピーに失敗しました。localhost（簡易サーバ）で開いてください。";
+  if (feedbackEl && (feedbackEl.innerHTML ?? "") === "") {
+    feedbackEl.innerHTML = `<p>${escapeHTML(msg)}</p>`;
+  } else {
+    alert(msg);
+  }
+}
+
+
+/***********************
+ * 初期化
  ***********************/
 document.addEventListener("DOMContentLoaded", () => {
   showScreen("start");
@@ -967,4 +868,5 @@ document.addEventListener("DOMContentLoaded", () => {
   explainBtn.addEventListener("click", showExplanation);
   nextBtn.addEventListener("click", goToNextQuestion);
   restartBtn.addEventListener("click", startQuiz);
+  if (copyEditBtn) copyEditBtn.addEventListener("click", copyForEditCurrentQuestion);
 });
